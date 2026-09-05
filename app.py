@@ -20,48 +20,55 @@ store, mode = get_store()
 CLUB_NAME = get_setting("CLUB_NAME", "澳門大學羽毛球會")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _snapshot(_store):
-    """一次 API 調用讀取全三張表，30 秒緩存。_store 前綴下劃線 = 不參與 cache key。"""
-    return _store.snapshot()
+import time as _time
+
+# 手動快取（不依賴 st.cache_data，避免對象哈希問題）
+_snap_cache = {"data": None, "ts": 0}
+_SNAP_TTL = 30  # 秒
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _board(_store):
-    """基於 _snapshot 的快照推導出場次 + 報名狀態，不再獨立讀 API。"""
-    snap = _snapshot(_store)
+def _snapshot():
+    """一次 API 調用讀取全三張表，30 秒手動快取。"""
+    now_ts = _time.time()
+    if _snap_cache["data"] is not None and (now_ts - _snap_cache["ts"]) < _SNAP_TTL:
+        return _snap_cache["data"]
+    data = store.snapshot()
+    _snap_cache["data"] = data
+    _snap_cache["ts"] = now_ts
+    return data
+
+
+def _board():
+    """基於 _snapshot 推導出場次 + 報名狀態，不讀 API。"""
+    snap = _snapshot()
     today_iso = f"{now_macau().date():%Y-%m-%d}"
-    events = _store._list_events_from(snap["events"])
+    events = store._list_events_from(snap["events"])
     upcoming = [e for e in events if e["date"] >= today_iso][:8]
-    regs = {e["event_id"]: _store.registrations_from(e["event_id"], events, snap["registrations"])
+    regs = {e["event_id"]: store.registrations_from(e["event_id"], events, snap["registrations"])
             for e in upcoming}
     return upcoming, regs
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _week_count(_store, name, date_iso):
+def _week_count(name, date_iso):
     """基於 _snapshot 推導，不讀 API。"""
     d = parse_date(date_iso)
     if not d:
         return 0
-    snap = _snapshot(_store)
-    events = _store._list_events_from(snap["events"])
-    return _store._week_count_from(name, d, events, snap["registrations"])
+    snap = _snapshot()
+    events = store._list_events_from(snap["events"])
+    return store._week_count_from(name, d, events, snap["registrations"])
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _members_list(_store):
+def _members_list():
     """基於 _snapshot，不讀 API。"""
-    return sorted({norm_name(r.get("name")) for r in _snapshot(_store)["members"]
+    return sorted({norm_name(r.get("name")) for r in _snapshot()["members"]
                    if norm_name(r.get("name"))})
 
 
 def _clear_all_cache():
-    """清掉所有快取（報名/取消/會員變動後調用）。"""
-    _snapshot.clear()
-    _board.clear()
-    _week_count.clear()
-    _members_list.clear()
+    """清掉快取（報名/取消/會員變動後調用）。"""
+    _snap_cache["data"] = None
+    _snap_cache["ts"] = 0
 
 
 def _identity(store) -> str:
@@ -83,7 +90,7 @@ def _identity(store) -> str:
             st.rerun()
         return ss.member_name
 
-    members = _members_list(store)
+    members = _members_list()
     with st.form("form_identity", border=True):
         st.text_input(
             "輸入或選擇姓名 Type or pick your name",
@@ -119,10 +126,10 @@ name = _identity(store)
 if not name:
     st.info("請先輸入或選擇姓名，再進行報名。Please type or pick your name first.")
 else:
-    upcoming, regs = _board(store)
+    upcoming, regs = _board()
     now = now_macau()
 
-    wc = _week_count(store, name, f"{now.date():%Y-%m-%d}")
+    wc = _week_count(name, f"{now.date():%Y-%m-%d}")
     st.caption(f"本週已報名 {wc} 場 · {name}，你好！You have {wc} session(s) this week.")
 
     if not upcoming:
@@ -181,7 +188,7 @@ else:
                             else:
                                 st.toast("報名成功 You're in!" if res["role"] == "confirmed"
                                          else "已加入候補 On the waitlist")
-                                if _week_count(store, name, ev["date"]) >= 3:
+                                if _week_count(name, ev["date"]) >= 3:
                                     st.warning("溫馨提示：這是你本週第 3 場。原則上建議每週兩場，記得量力而行。"
                                                "Note: this is your 3rd session this week (2 recommended).")
                             st.rerun()
@@ -254,7 +261,7 @@ _FE_JS = r"""
 </script>
 """
 
-_members_js = json.dumps(_members_list(store), ensure_ascii=False)
+_members_js = json.dumps(_members_list(), ensure_ascii=False)
 components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
 
 # 開搶後 10 分鐘內每 5 秒刷新，即時看到名額變化（搶位進行時）
