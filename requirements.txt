@@ -1,3 +1,4 @@
+# 触发 Streamlit Cloud 重建缓存
 streamlit>=1.36
 gspread>=6.0
 google-auth>=2.28

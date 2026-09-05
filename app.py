@@ -28,39 +28,97 @@ _SNAP_TTL = 30  # 秒
 
 
 def _snapshot():
-    """一次 API 調用讀取全三張表，30 秒手動快取。"""
+    """一次 API 調用讀取全三張表，30 秒手動快取。直接調 backend.read，不依賴 store.snapshot。"""
     now_ts = _time.time()
     if _snap_cache["data"] is not None and (now_ts - _snap_cache["ts"]) < _SNAP_TTL:
         return _snap_cache["data"]
-    data = store.snapshot()
+    data = {
+        "events": store.b.read("events"),
+        "registrations": store.b.read("registrations"),
+        "members": store.b.read("members"),
+    }
     _snap_cache["data"] = data
     _snap_cache["ts"] = now_ts
     return data
 
 
+def _parse_events(raw):
+    """从原始行解析场次列表（内联，不依赖 core 新方法）。"""
+    from core import to_int, parse_dt
+    out = []
+    for r in raw:
+        if not r.get("event_id") or not r.get("date"):
+            continue
+        out.append({
+            "event_id": r["event_id"], "date": str(r.get("date", "")),
+            "start_time": str(r.get("start_time", "")),
+            "capacity": to_int(r.get("capacity"), 24),
+            "open_at": parse_dt(r.get("open_at")),
+            "export_at": parse_dt(r.get("export_at")),
+            "created_at": r.get("created_at", ""),
+        })
+    out.sort(key=lambda e: (e["date"], e["start_time"]))
+    return out
+
+
+def _derive_regs(raw_regs, capacity):
+    """内联推导正选/候补（不依赖 core 新方法）。"""
+    from core import parse_dt, norm_name, to_bool, EPOCH
+    actives = [dict(r) for r in raw_regs if str(r.get("status", "")) == "active"]
+    dedup = {}
+    for r in sorted(actives, key=lambda r: parse_dt(r.get("joined_at")) or EPOCH):
+        dedup.setdefault(norm_name(r.get("name")), r)
+    ordered = sorted(dedup.values(), key=lambda r: parse_dt(r.get("joined_at")) or EPOCH)
+    cancelled = [r for r in raw_regs if str(r.get("status", "")) == "cancelled"]
+    for i, r in enumerate(ordered):
+        r["name"] = norm_name(r.get("name"))
+        r["paid"] = to_bool(r.get("paid"))
+        r["joined_dt"] = parse_dt(r.get("joined_at")) or EPOCH
+        if i < capacity:
+            r["role"], r["position"] = "confirmed", 0
+        else:
+            r["role"], r["position"] = "waitlist", i - capacity + 1
+    return ordered, cancelled
+
+
 def _board():
-    """基於 _snapshot 推導出場次 + 報名狀態，不讀 API。"""
+    """基于快照推导出场次 + 报名状态，不读 API。"""
     snap = _snapshot()
     today_iso = f"{now_macau().date():%Y-%m-%d}"
-    events = store._list_events_from(snap["events"])
+    events = _parse_events(snap["events"])
     upcoming = [e for e in events if e["date"] >= today_iso][:8]
-    regs = {e["event_id"]: store.registrations_from(e["event_id"], events, snap["registrations"])
-            for e in upcoming}
+    regs = {}
+    for e in upcoming:
+        ev_regs = [r for r in snap["registrations"] if r.get("event_id") == e["event_id"]]
+        actives, cancelled = _derive_regs(ev_regs, e["capacity"])
+        regs[e["event_id"]] = {"event": e, "actives": actives, "cancelled": cancelled}
     return upcoming, regs
 
 
 def _week_count(name, date_iso):
-    """基於 _snapshot 推導，不讀 API。"""
+    """基于快照推导，不读 API。"""
+    from core import parse_date, norm_name
     d = parse_date(date_iso)
     if not d:
         return 0
     snap = _snapshot()
-    events = store._list_events_from(snap["events"])
-    return store._week_count_from(name, d, events, snap["registrations"])
+    events = _parse_events(snap["events"])
+    name = norm_name(name)
+    week = d.isocalendar()[:2]
+    n = 0
+    for ev in events:
+        ev_d = parse_date(ev["date"])
+        if not ev_d or ev_d.isocalendar()[:2] != week:
+            continue
+        ev_regs = [r for r in snap["registrations"] if r.get("event_id") == ev["event_id"]]
+        actives, _ = _derive_regs(ev_regs, ev["capacity"])
+        if any(r["name"] == name for r in actives):
+            n += 1
+    return n
 
 
 def _members_list():
-    """基於 _snapshot，不讀 API。"""
+    """基于快照，不读 API。"""
     return sorted({norm_name(r.get("name")) for r in _snapshot()["members"]
                    if norm_name(r.get("name"))})
 
