@@ -3,3 +3,5 @@ __pycache__/
 data/
 .venv/
 .streamlit/secrets.toml
+service_account.json
+*.json.key
