@@ -20,24 +20,48 @@ store, mode = get_store()
 CLUB_NAME = get_setting("CLUB_NAME", "澳門大學羽毛球會")
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
+def _snapshot():
+    """一次 API 調用讀取全三張表，30 秒緩存。根治 429。"""
+    return store.snapshot()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def _board():
-    """全站共用 5 秒快取，保護 Google Sheets 讀取配額。"""
+    """基於 _snapshot 的快照推導出場次 + 報名狀態，不再獨立讀 API。"""
+    snap = _snapshot()
     today_iso = f"{now_macau().date():%Y-%m-%d}"
-    upcoming = [e for e in store.list_events() if e["date"] >= today_iso][:8]
-    regs = {e["event_id"]: store.registrations(e["event_id"]) for e in upcoming}
+    events = store._list_events_from(snap["events"])
+    upcoming = [e for e in events if e["date"] >= today_iso][:8]
+    regs = {e["event_id"]: store.registrations_from(e["event_id"], events, snap["registrations"])
+            for e in upcoming}
     return upcoming, regs
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def _week_count(name, date_iso):
+    """基於 _snapshot 推導，不讀 API。"""
     d = parse_date(date_iso)
-    return store.active_week_count(name, d) if d else 0
+    if not d:
+        return 0
+    snap = _snapshot()
+    events = store._list_events_from(snap["events"])
+    return store._week_count_from(name, d, events, snap["registrations"])
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _members_list():
-    return store.members()
+    """基於 _snapshot，不讀 API。"""
+    return sorted({norm_name(r.get("name")) for r in _snapshot()["members"]
+                   if norm_name(r.get("name"))})
+
+
+def _clear_all_cache():
+    """清掉所有快取（報名/取消/會員變動後調用）。"""
+    _snapshot.clear()
+    _board.clear()
+    _week_count.clear()
+    _members_list.clear()
 
 
 def _identity(store) -> str:
@@ -141,7 +165,7 @@ else:
                         st.warning(f"🟡 候補中 Waitlist #{mine['position']}")
                     if st.button("取消報名 Cancel", key=f"cancel_{ev['event_id']}"):
                         store.cancel(mine["reg_id"])
-                        _board.clear()
+                        _clear_all_cache()
                         st.toast("已取消 Cancelled · 候補自動遞補 Waitlist auto-promoted")
                         st.rerun()
                 else:
@@ -151,7 +175,7 @@ else:
                     if st.button(label, type="primary", key=f"reg_{ev['event_id']}"):
                         try:
                             res = store.register(ev["event_id"], name)
-                            _board.clear()
+                            _clear_all_cache()
                             if res.get("duplicate"):
                                 st.toast("你已在名單中 Already registered")
                             else:

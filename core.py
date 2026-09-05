@@ -189,18 +189,16 @@ class SheetsBackend:
 
     @staticmethod
     def _retry(fn, *args, **kwargs):
-        """對 gspread API 調用做指數退避重試，專治 429 配額錯誤。"""
+        """對 gspread API 調用做溫和重試：429 只等 2 秒重試一次（避免重試本身疊加請求）。"""
         import time
-        for attempt in range(5):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                msg = str(e)
-                is_429 = "429" in msg or "Quota" in msg or "RESOURCE_EXHAUSTED" in msg
-                if not is_429 or attempt == 4:
-                    raise
-                time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s, 12s
-        raise RuntimeError("retry exhausted")
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "Quota" in msg or "RESOURCE_EXHAUSTED" in msg:
+                time.sleep(2)
+                return fn(*args, **kwargs)  # 只重試一次
+            raise
 
     def _ws(self, table):
         # 用緩存的 worksheets() 列表比對，避免每次拉 metadata
@@ -291,6 +289,16 @@ class ClubStore:
     def __init__(self, backend):
         self.b = backend
 
+    # ---------- 批量快照（一次讀三張表，大幅降低 API 請求數） ----------
+    def snapshot(self):
+        """一次讀取 events / registrations / members 三張表，返回原始行列表。
+        調用方負責在 st.cache_data 裡緩存結果。"""
+        return {
+            "events": self.b.read("events"),
+            "registrations": self.b.read("registrations"),
+            "members": self.b.read("members"),
+        }
+
     # ---------- 場次 ----------
     def add_event(self, d: date, start_time: str, capacity: int,
                   open_at: datetime, export_at: datetime | None = None) -> str:
@@ -320,8 +328,12 @@ class ClubStore:
         self.b.delete_where("events", {"event_id": event_id})
 
     def list_events(self) -> list[dict]:
+        return self._list_events_from(self.b.read("events"))
+
+    @staticmethod
+    def _list_events_from(raw_events):
         out = []
-        for r in self.b.read("events"):
+        for r in raw_events:
             if not r.get("event_id") or not r.get("date"):
                 continue
             out.append({
@@ -342,7 +354,8 @@ class ClubStore:
         return None
 
     # ---------- 報名 ----------
-    def _derive(self, raw_regs, capacity):
+    @staticmethod
+    def _derive(raw_regs, capacity):
         """按 joined_at 推導正選/候補；同名去重保留最早的有效報名。"""
         actives = [dict(r) for r in raw_regs if str(r.get("status", "")) == "active"]
         dedup = {}
@@ -368,6 +381,15 @@ class ClubStore:
         if not ev:
             raise EventNotFound("場次不存在 Event not found")
         actives, cancelled = self._derive(self._event_regs(event_id), ev["capacity"])
+        return {"event": ev, "actives": actives, "cancelled": cancelled}
+
+    def registrations_from(self, event_id, events, all_regs):
+        """純計算版本：用 snapshot 數據，不讀 API。"""
+        ev = next((e for e in events if e["event_id"] == event_id), None)
+        if not ev:
+            raise EventNotFound("場次不存在 Event not found")
+        regs = [r for r in all_regs if r.get("event_id") == event_id]
+        actives, cancelled = self._derive(regs, ev["capacity"])
         return {"event": ev, "actives": actives, "cancelled": cancelled}
 
     def register(self, event_id, name) -> dict:
@@ -406,14 +428,19 @@ class ClubStore:
                             {"paid": "TRUE" if paid else "FALSE"})
 
     def active_week_count(self, name, ref_date: date) -> int:
+        return self._week_count_from(name, ref_date, self.list_events(), self.b.read("registrations"))
+
+    @staticmethod
+    def _week_count_from(name, ref_date, events, all_regs):
         name = norm_name(name)
         week = ref_date.isocalendar()[:2]
         n = 0
-        for ev in self.list_events():
+        for ev in events:
             d = parse_date(ev["date"])
             if not d or d.isocalendar()[:2] != week:
                 continue
-            actives, _ = self._derive(self._event_regs(ev["event_id"]), ev["capacity"])
+            regs = [r for r in all_regs if r.get("event_id") == ev["event_id"]]
+            actives, _ = ClubStore._derive(regs, ev["capacity"])
             if any(r["name"] == name for r in actives):
                 n += 1
         return n
