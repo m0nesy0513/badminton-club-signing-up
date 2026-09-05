@@ -290,31 +290,42 @@ _FE_JS = r"""
       if (inp && !inp.getAttribute('list')) inp.setAttribute('list','bcm_members');
     } catch(e){}
   }
-  if (win.__bcm_tick){ setup(); return; }
-  win.__bcm_tick = true;
   function pad(n){ return String(n).padStart(2,'0'); }
-  var reloaded = false;
-  function tick(){
-    var now = Date.now();
-    var opened = false;
-    win.document.querySelectorAll('.bcm_cd').forEach(function(el){
-      var ts = parseInt(el.getAttribute('data-ts')||'0',10);
-      if (!ts) return;
-      var diff = Math.floor((ts*1000 - now)/1000);
-      if (diff <= 0){ el.textContent = '即將開放 Opening…'; opened = true; }
-      else {
-        var d = Math.floor(diff/86400), h = Math.floor((diff%86400)/3600),
-            m = Math.floor((diff%3600)/60), s = diff%60;
-        el.textContent = (d>0? d+'天 ':'') + pad(h)+':'+pad(m)+':'+pad(s);
-      }
-    });
-    if (opened && !reloaded){ reloaded = true; setTimeout(function(){ win.location.reload(); }, 700); }
+  // 關鍵：把 setInterval 註冊在「父視窗」上，這樣 component iframe 被 Streamlit
+  // rerun 銷毀後，計時器仍會繼續在父頁跑；否則舊 iframe 一死、計時器跟著死，
+  // 而 __bcm_tick 旗標又卡住不讓新 iframe 重新啟動 → 倒計時凝固不動。
+  // 每次注入都先清掉舊的父頁計時器再註冊新的，確保任何時刻只有一個在跑。
+  if (!win.__bcm_tick){
+    win.__bcm_tick = function(){
+      var now = Date.now();
+      var opened = false;
+      try {
+        win.document.querySelectorAll('.bcm_cd').forEach(function(el){
+          var ts = parseInt(el.getAttribute('data-ts')||'0',10);
+          if (!ts) return;
+          var diff = Math.floor((ts*1000 - now)/1000);
+          if (diff <= 0){ el.textContent = '即將開放 Opening…'; opened = true; }
+          else {
+            var d = Math.floor(diff/86400), h = Math.floor((diff%86400)/3600),
+                m = Math.floor((diff%3600)/60), s = diff%60;
+            el.textContent = (d>0? d+'天 ':'') + pad(h)+':'+pad(m)+':'+pad(s);
+          }
+        });
+      } catch(e){}
+      if (opened && !win.__bcm_reloaded){ win.__bcm_reloaded = true; setTimeout(function(){ try{ win.location.reload(); }catch(e){} }, 700); }
+    };
   }
-  setInterval(tick, 1000);
-  // Streamlit rerun 後 DOM 會重建，需重新綁定 datalist
-  var obs = new MutationObserver(function(){ setup(); });
-  try { obs.observe(win.document.body, {childList:true, subtree:true}); } catch(e){}
-  setup(); tick();
+  try { if (win.__bcm_tick_id) win.clearInterval(win.__bcm_tick_id); } catch(e){}
+  win.__bcm_tick_id = win.setInterval(win.__bcm_tick, 1000);
+  // Streamlit rerun 後 DOM 會重建，需重新綁定 datalist（只綁一次 observer）
+  if (!win.__bcm_obs){
+    try {
+      var obs = new win.MutationObserver(function(){ setup(); });
+      obs.observe(win.document.body, {childList:true, subtree:true});
+      win.__bcm_obs = true;
+    } catch(e){}
+  }
+  setup(); win.__bcm_tick();
 })();
 </script>
 """
