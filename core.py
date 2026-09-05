@@ -180,17 +180,35 @@ class SheetsBackend:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         self.sh = gspread.authorize(creds).open_by_key(sheet_id)
+        self._tabs_cache: set[str] | None = None
         self._ensure_tabs()
 
     def _ws(self, table):
-        return self.sh.worksheet(table)
+        # worksheet() 每次都會拉 metadata，用 worksheets() 緩存比對更穩
+        for w in self.sh.worksheets():
+            if w.title == table:
+                return w
+        raise RegError(f"分頁不存在 Sheet tab not found: {table}")
 
     def _ensure_tabs(self):
-        existing = {w.title for w in self.sh.worksheets()}
+        if self._tabs_cache is None:
+            try:
+                existing = {w.title for w in self.sh.worksheets()}
+            except Exception as e:
+                # 首次拉 metadata 就失敗 — 常見於共享權限不對或配額
+                raise RegError(
+                    f"無法讀取 Google Sheet（檢查服務账号邮箱是否已共享为编辑者 / 是否触发配额）"
+                    f"Cannot read Google Sheet: {type(e).__name__}: {e}"
+                ) from e
+            self._tabs_cache = existing
         for t, cols in TABLES.items():
-            if t not in existing:
-                ws = self.sh.add_worksheet(title=t, rows=2000, cols=max(10, len(cols)))
-                ws.append_row(cols, value_input_option="RAW")
+            if t not in self._tabs_cache:
+                try:
+                    ws = self.sh.add_worksheet(title=t, rows=2000, cols=max(10, len(cols)))
+                    ws.append_row(cols, value_input_option="RAW")
+                    self._tabs_cache.add(t)
+                except Exception as e:
+                    raise RegError(f"无法创建分页 Cannot create tab {t}: {e}") from e
 
     def read(self, table):
         vals = self._ws(table).get_all_values()
