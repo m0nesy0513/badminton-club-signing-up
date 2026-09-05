@@ -54,7 +54,7 @@ def _identity(store) -> str:
             st.rerun()
         return ss.member_name
 
-    members = store.members()
+    members = _members_list()
     with st.form("form_identity", border=True):
         st.text_input(
             "輸入或選擇姓名 Type or pick your name",
@@ -225,7 +225,11 @@ _FE_JS = r"""
 </script>
 """
 
-_members_js = json.dumps(store.members(), ensure_ascii=False)
+@st.cache_data(ttl=30, show_spinner=False)
+def _members_list():
+    return store.members()
+
+_members_js = json.dumps(_members_list(), ensure_ascii=False)
 components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
 
 # 開搶後 10 分鐘內每 5 秒刷新，即時看到名額變化（搶位進行時）

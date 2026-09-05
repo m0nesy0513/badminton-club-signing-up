@@ -172,7 +172,10 @@ class CSVBackend:
 
 
 class SheetsBackend:
-    """Google Sheets 儲存（正式環境），每張表一個分頁，全部以 RAW 文本寫入。"""
+    """Google Sheets 儲存（正式環境），每張表一個分頁，全部以 RAW 文本寫入。
+
+    內建指數退避重試（429 配額保護）+ worksheets() 緩存（避免每次拉 metadata）。
+    """
 
     def __init__(self, sheet_id: str, service_account_info: dict):
         import gspread
@@ -181,37 +184,55 @@ class SheetsBackend:
         creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         self.sh = gspread.authorize(creds).open_by_key(sheet_id)
         self._tabs_cache: set[str] | None = None
+        self._ws_cache: dict[str, object] | None = None
         self._ensure_tabs()
 
+    @staticmethod
+    def _retry(fn, *args, **kwargs):
+        """對 gspread API 調用做指數退避重試，專治 429 配額錯誤。"""
+        import time
+        for attempt in range(5):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                msg = str(e)
+                is_429 = "429" in msg or "Quota" in msg or "RESOURCE_EXHAUSTED" in msg
+                if not is_429 or attempt == 4:
+                    raise
+                time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s, 12s
+        raise RuntimeError("retry exhausted")
+
     def _ws(self, table):
-        # worksheet() 每次都會拉 metadata，用 worksheets() 緩存比對更穩
-        for w in self.sh.worksheets():
-            if w.title == table:
-                return w
-        raise RegError(f"分頁不存在 Sheet tab not found: {table}")
+        # 用緩存的 worksheets() 列表比對，避免每次拉 metadata
+        if self._ws_cache is None:
+            self._ws_cache = {w.title: w for w in self.sh.worksheets()}
+        if table not in self._ws_cache:
+            raise RegError(f"分頁不存在 Sheet tab not found: {table}")
+        return self._ws_cache[table]
 
     def _ensure_tabs(self):
         if self._tabs_cache is None:
             try:
-                existing = {w.title for w in self.sh.worksheets()}
+                ws_list = self.sh.worksheets()
             except Exception as e:
-                # 首次拉 metadata 就失敗 — 常見於共享權限不對或配額
                 raise RegError(
-                    f"無法讀取 Google Sheet（檢查服務账号邮箱是否已共享为编辑者 / 是否触发配额）"
+                    f"無法讀取 Google Sheet（檢查服務账号邮箱是否已共享为编辑者）"
                     f"Cannot read Google Sheet: {type(e).__name__}: {e}"
                 ) from e
-            self._tabs_cache = existing
+            self._tabs_cache = {w.title for w in ws_list}
+            self._ws_cache = {w.title: w for w in ws_list}
         for t, cols in TABLES.items():
-            if t not in self._tabs_cache:
+            if t not in self._ws_cache:
                 try:
                     ws = self.sh.add_worksheet(title=t, rows=2000, cols=max(10, len(cols)))
-                    ws.append_row(cols, value_input_option="RAW")
+                    self._retry(ws.append_row, cols, value_input_option="RAW")
+                    self._ws_cache[t] = ws
                     self._tabs_cache.add(t)
                 except Exception as e:
                     raise RegError(f"无法创建分页 Cannot create tab {t}: {e}") from e
 
     def read(self, table):
-        vals = self._ws(table).get_all_values()
+        vals = self._retry(self._ws(table).get_all_values)
         if len(vals) < 2:
             return []
         header = [h.strip() for h in vals[0]]
@@ -219,11 +240,12 @@ class SheetsBackend:
                  for i, h in enumerate(header)} for row in vals[1:]]
 
     def append(self, table, row):
-        self._ws(table).append_row([str(row.get(c, "")) for c in TABLES[table]],
-                                   value_input_option="RAW")
+        self._retry(self._ws(table).append_row,
+                    [str(row.get(c, "")) for c in TABLES[table]],
+                    value_input_option="RAW")
 
     def _match_indices(self, table, match):
-        vals = self._ws(table).get_all_values()
+        vals = self._retry(self._ws(table).get_all_values)
         header = [h.strip() for h in vals[0]] if vals else []
         idx = {c: i for i, c in enumerate(header)}
         out = []
@@ -239,13 +261,13 @@ class SheetsBackend:
         for rno in rows:
             for k, v in updates.items():
                 if k in idx:
-                    ws.update_cell(rno, idx[k] + 1, str(v))
+                    self._retry(ws.update_cell, rno, idx[k] + 1, str(v))
 
     def delete_where(self, table, match):
         rows, _ = self._match_indices(table, match)
         ws = self._ws(table)
         for rno in reversed(rows):
-            ws.delete_rows(rno)
+            self._retry(ws.delete_rows, rno)
 
     def replace_table(self, table, header, rows):
         try:
@@ -253,10 +275,14 @@ class SheetsBackend:
         except Exception:
             ws = self.sh.add_worksheet(title=table, rows=max(100, len(rows) + 2),
                                        cols=max(10, len(header)))
-        ws.clear()
-        ws.append_row(list(header), value_input_option="RAW")
+            if self._ws_cache is None:
+                self._ws_cache = {}
+            self._ws_cache[table] = ws
+        self._retry(ws.clear)
+        self._retry(ws.append_row, list(header), value_input_option="RAW")
         if rows:
-            ws.append_rows([[str(c) for c in r] for r in rows], value_input_option="RAW")
+            self._retry(ws.append_rows,
+                        [[str(c) for c in r] for r in rows], value_input_option="RAW")
 
 
 # ---------------------------------------------------------------- 業務層
