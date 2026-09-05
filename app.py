@@ -263,17 +263,18 @@ else:
                 if not confirmed and not waitlist:
                     st.caption("還沒有人報名 Nobody yet.")
 
-# ---------------------------------------------------------------- 前端腳本（用 st.html 直接注入 app 頁面，不走 component iframe）
-# 舊方案用 components.html(srcdoc iframe)，但 srcdoc 裡的 <script> 在 Streamlit
-# Cloud 上不會自動執行 → 倒計時凝固。st.html（1.39+）把 HTML 直接寫進 app 文檔，
-# <script> 在頁面上下文同步執行，最可靠。
+# ---------------------------------------------------------------- 前端腳本
+# 用 st.components.v1.html 注入獨立 component iframe：只有「真 iframe 文檔」裡的
+# <script> 才會執行（st.html 走 innerHTML，spec 規定 innerHTML 插入的 script 不執行）。
 # 1) 姓名框綁定 datalist 自動補全（輸入"陳"提示"陳大文"）
 # 2) 鎖定場次倒計時每秒跳動；到 0 自動刷新頁面讓報名按鈕出現
+import streamlit.components.v1 as components
+
 _FE_JS = r"""
 <script>
 (function(){
   var members = __MEMBERS__;
-  var win = window; // st.html 直接在 app 頁面執行，window 就是 app 視窗
+  var win = window.parent; // component iframe 的父頁 = Streamlit app 文檔
   function setup(){
     try {
       if (!win.__bcm_dl && members.length){
@@ -290,8 +291,7 @@ _FE_JS = r"""
     } catch(e){}
   }
   function pad(n){ return String(n).padStart(2,'0'); }
-  // 每次注入都先清掉舊計時器再註冊新的，確保任何時刻只有一個 interval 在跑
-  //（Streamlit rerun 會重新執行本段腳本，舊 interval 若不清掉會越積越多）。
+  // 把 tick 函式與 interval 都掛在父視窗，component iframe 被 rerun 銷毀後仍續跑。
   if (!win.__bcm_tick){
     win.__bcm_tick = function(){
       var now = Date.now();
@@ -322,12 +322,13 @@ _FE_JS = r"""
     } catch(e){}
   }
   setup(); win.__bcm_tick();
+  win.__bcm_booted = true; // 標記腳本已執行（診斷用）
 })();
 </script>
 """
 
 _members_js = json.dumps(_members_list(), ensure_ascii=False)
-st.html(_FE_JS.replace("__MEMBERS__", _members_js))
+components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
 
 # 開搶後 10 分鐘內每 5 秒刷新，即時看到名額變化（搶位進行時）
 try:
