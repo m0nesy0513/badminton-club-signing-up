@@ -1,0 +1,5 @@
+streamlit>=1.36
+gspread>=6.0
+google-auth>=2.28
+streamlit-autorefresh>=1.0.1
+tzdata>=2024.1
