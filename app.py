@@ -214,14 +214,12 @@ else:
 
             if not is_open:
                 remain = (open_at - now).total_seconds()
-                ts = int(open_at.timestamp())
-                # span 自帶 data-ts（開搶時刻 epoch）與 data-remain（初始剩餘秒）
-                # JS 每秒讀 data-ts 重新計算，不依賴外部 targets 對象何時注入
+                # 服務端每秒重算（由本檔末的 st_autorefresh 驅動整頁刷新），
+                # 不再靠前端 JS 讀秒（components.html 的 srcdoc / st.html 的 innerHTML
+                # 兩條注入路在 Streamlit Cloud 上都不會執行 <script>）。
                 st.markdown(
-                    f"🔒 報名將於 **{fmt_dt_short(open_at)}** 開放 Opens at {fmt_dt_short(open_at)} · "
-                    f"尚餘 <strong id='bcm_cd_{ev['event_id']}' class='bcm_cd' data-ts='{ts}' data-remain='{int(remain)}'>"
-                    f"{fmt_countdown(remain)}</strong>",
-                    unsafe_allow_html=True)
+                    f"🔒 報名將於 **{fmt_dt_short(open_at)}** 開放 Opens at {fmt_dt_short(open_at)}")
+                st.markdown(f"⏳ 尚餘 **{fmt_countdown(remain)}**")
             else:
                 if mine:
                     if mine["role"] == "confirmed":
@@ -263,80 +261,28 @@ else:
                 if not confirmed and not waitlist:
                     st.caption("還沒有人報名 Nobody yet.")
 
-# ---------------------------------------------------------------- 前端腳本
-# 用 st.components.v1.html 注入獨立 component iframe：只有「真 iframe 文檔」裡的
-# <script> 才會執行（st.html 走 innerHTML，spec 規定 innerHTML 插入的 script 不執行）。
-# 1) 姓名框綁定 datalist 自動補全（輸入"陳"提示"陳大文"）
-# 2) 鎖定場次倒計時每秒跳動；到 0 自動刷新頁面讓報名按鈕出現
-import streamlit.components.v1 as components
-
-_FE_JS = r"""
-<script>
-(function(){
-  var members = __MEMBERS__;
-  var win = window.parent; // component iframe 的父頁 = Streamlit app 文檔
-  function setup(){
-    try {
-      if (!win.__bcm_dl && members.length){
-        var dl = win.document.createElement('datalist');
-        dl.id = 'bcm_members';
-        members.forEach(function(m){ var o = win.document.createElement('option'); o.value=m; dl.appendChild(o); });
-        win.document.body.appendChild(dl);
-        win.__bcm_dl = true;
-      }
-    } catch(e){}
-    try {
-      var inp = win.document.querySelector('.st-key-ident_name input');
-      if (inp && !inp.getAttribute('list')) inp.setAttribute('list','bcm_members');
-    } catch(e){}
-  }
-  function pad(n){ return String(n).padStart(2,'0'); }
-  // 把 tick 函式與 interval 都掛在父視窗，component iframe 被 rerun 銷毀後仍續跑。
-  if (!win.__bcm_tick){
-    win.__bcm_tick = function(){
-      var now = Date.now();
-      var opened = false;
-      try {
-        win.document.querySelectorAll('.bcm_cd').forEach(function(el){
-          var ts = parseInt(el.getAttribute('data-ts')||'0',10);
-          if (!ts) return;
-          var diff = Math.floor((ts*1000 - now)/1000);
-          if (diff <= 0){ el.textContent = '即將開放 Opening…'; opened = true; }
-          else {
-            var d = Math.floor(diff/86400), h = Math.floor((diff%86400)/3600),
-                m = Math.floor((diff%3600)/60), s = diff%60;
-            el.textContent = (d>0? d+'天 ':'') + pad(h)+':'+pad(m)+':'+pad(s);
-          }
-        });
-      } catch(e){}
-      if (opened && !win.__bcm_reloaded){ win.__bcm_reloaded = true; setTimeout(function(){ try{ win.location.reload(); }catch(e){} }, 700); }
-    };
-  }
-  try { if (win.__bcm_tick_id) win.clearInterval(win.__bcm_tick_id); } catch(e){}
-  win.__bcm_tick_id = win.setInterval(win.__bcm_tick, 1000);
-  if (!win.__bcm_obs){
-    try {
-      var obs = new win.MutationObserver(function(){ setup(); });
-      obs.observe(win.document.body, {childList:true, subtree:true});
-      win.__bcm_obs = true;
-    } catch(e){}
-  }
-  setup(); win.__bcm_tick();
-  win.__bcm_booted = true; // 標記腳本已執行（診斷用）
-})();
-</script>
-"""
-
-_members_js = json.dumps(_members_list(), ensure_ascii=False)
-components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
-
-# 開搶後 10 分鐘內每 5 秒刷新，即時看到名額變化（搶位進行時）
+# ---------------------------------------------------------------- 自動刷新（驅動倒計時每秒讀秒 + 開搶後即時看名額）
+# 前端 JS 讀秒在 Streamlit Cloud 上不可行（components.html 的 srcdoc 腳本、
+# st.html 的 innerHTML 腳本都不會執行），改用 streamlit-autorefresh 整頁刷新，
+# 由服務端每秒重算 fmt_countdown(remain)。_snapshot 有 30s 快取，每秒刷新不會
+# 爆 Google Sheets 429。
+# - 有「鎖定中」場次 → 每 1 秒刷新（讀秒；到 0 自動切到報名按鈕）
+# - 有「剛開搶 0~10 分」場次 → 每 5 秒刷新（即時看名額被搶）
+# - 兩者都有 → 取更快的 1 秒
 try:
     from streamlit_autorefresh import st_autorefresh
-    if name:
-        _post = [(now_macau() - e["open_at"]).total_seconds()
-                 for e in store.list_events() if e["open_at"]]
-        if any(0 <= t <= 600 for t in _post):
+    if name and upcoming:
+        _now = now_macau()
+        _has_locked = any(
+            (ev["open_at"] and ev["open_at"] > _now) for ev in upcoming
+        )
+        _has_just_opened = any(
+            (ev["open_at"] and 0 <= (_now - ev["open_at"]).total_seconds() <= 600)
+            for ev in upcoming
+        )
+        if _has_locked:
+            st_autorefresh(interval=1000, key="ar_cd")
+        elif _has_just_opened:
             st_autorefresh(interval=5000, key="ar_post")
 except Exception:
     pass
