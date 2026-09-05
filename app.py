@@ -254,10 +254,23 @@ else:
                 st.caption("提前取消不處罰，名額自動由候補遞補。Cancel anytime — no penalty, waitlist auto-promotes.")
 
             with st.expander("查看名單 View list"):
-                if confirmed:
-                    st.markdown("🟢 **正選 Confirmed**：" + "、".join(r["name"] for r in confirmed))
-                if waitlist:
-                    st.markdown("🟡 **候補 Waitlist**：" + "、".join(f"{r['name']} #{r['position']}" for r in waitlist))
+                sort_opt = "order"
+                if confirmed or waitlist:
+                    sort_opt = st.selectbox(
+                        "排序 Sort",
+                        ["order", "name"],
+                        format_func=lambda x: "報名順序 Registration order" if x == "order" else "姓名排序 By name",
+                        key=f"sort_{ev['event_id']}")
+                if sort_opt == "name":
+                    confirmed_v = sorted(confirmed, key=lambda r: r["name"])
+                    waitlist_v = sorted(waitlist, key=lambda r: r["name"])
+                else:
+                    confirmed_v, waitlist_v = confirmed, waitlist
+                if confirmed_v:
+                    st.markdown("🟢 **正選 Confirmed**：" + "、".join(r["name"] for r in confirmed_v))
+                if waitlist_v:
+                    # 候補按所選排序顯示，但 #號仍是原本的排隊順位（不會因排序改變）
+                    st.markdown("🟡 **候補 Waitlist**：" + "、".join(f"{r['name']} #{r['position']}" for r in waitlist_v))
                 if not confirmed and not waitlist:
                     st.caption("還沒有人報名 Nobody yet.")
 
