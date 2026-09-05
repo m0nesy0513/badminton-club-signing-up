@@ -263,18 +263,17 @@ else:
                 if not confirmed and not waitlist:
                     st.caption("還沒有人報名 Nobody yet.")
 
-# ---------------------------------------------------------------- 前端腳本（用 st.components.v1.html 注入獨立 iframe，注入即執行）
-# 解決 streamlit_js_eval 在 rerun 時序中注入不可靠的問題。
+# ---------------------------------------------------------------- 前端腳本（用 st.html 直接注入 app 頁面，不走 component iframe）
+# 舊方案用 components.html(srcdoc iframe)，但 srcdoc 裡的 <script> 在 Streamlit
+# Cloud 上不會自動執行 → 倒計時凝固。st.html（1.39+）把 HTML 直接寫進 app 文檔，
+# <script> 在頁面上下文同步執行，最可靠。
 # 1) 姓名框綁定 datalist 自動補全（輸入"陳"提示"陳大文"）
 # 2) 鎖定場次倒計時每秒跳動；到 0 自動刷新頁面讓報名按鈕出現
-import html as _html  # noqa: F401  保留供未來擴展
-import streamlit.components.v1 as components
-
 _FE_JS = r"""
 <script>
 (function(){
   var members = __MEMBERS__;
-  var win = window.parent; // component iframe 的父頁就是 Streamlit 主頁
+  var win = window; // st.html 直接在 app 頁面執行，window 就是 app 視窗
   function setup(){
     try {
       if (!win.__bcm_dl && members.length){
@@ -291,10 +290,8 @@ _FE_JS = r"""
     } catch(e){}
   }
   function pad(n){ return String(n).padStart(2,'0'); }
-  // 關鍵：把 setInterval 註冊在「父視窗」上，這樣 component iframe 被 Streamlit
-  // rerun 銷毀後，計時器仍會繼續在父頁跑；否則舊 iframe 一死、計時器跟著死，
-  // 而 __bcm_tick 旗標又卡住不讓新 iframe 重新啟動 → 倒計時凝固不動。
-  // 每次注入都先清掉舊的父頁計時器再註冊新的，確保任何時刻只有一個在跑。
+  // 每次注入都先清掉舊計時器再註冊新的，確保任何時刻只有一個 interval 在跑
+  //（Streamlit rerun 會重新執行本段腳本，舊 interval 若不清掉會越積越多）。
   if (!win.__bcm_tick){
     win.__bcm_tick = function(){
       var now = Date.now();
@@ -317,7 +314,6 @@ _FE_JS = r"""
   }
   try { if (win.__bcm_tick_id) win.clearInterval(win.__bcm_tick_id); } catch(e){}
   win.__bcm_tick_id = win.setInterval(win.__bcm_tick, 1000);
-  // Streamlit rerun 後 DOM 會重建，需重新綁定 datalist（只綁一次 observer）
   if (!win.__bcm_obs){
     try {
       var obs = new win.MutationObserver(function(){ setup(); });
@@ -331,7 +327,7 @@ _FE_JS = r"""
 """
 
 _members_js = json.dumps(_members_list(), ensure_ascii=False)
-components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
+st.html(_FE_JS.replace("__MEMBERS__", _members_js))
 
 # 開搶後 10 分鐘內每 5 秒刷新，即時看到名額變化（搶位進行時）
 try:
