@@ -35,6 +35,11 @@ def _week_count(name, date_iso):
     return store.active_week_count(name, d) if d else 0
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _members_list():
+    return store.members()
+
+
 def _identity(store) -> str:
     """身份用 session_state + URL query param 記住，零 JS、同步、秒開。"""
     ss = st.session_state
@@ -224,10 +229,6 @@ _FE_JS = r"""
 })();
 </script>
 """
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _members_list():
-    return store.members()
 
 _members_js = json.dumps(_members_list(), ensure_ascii=False)
 components.html(_FE_JS.replace("__MEMBERS__", _members_js), height=0, width=0)
